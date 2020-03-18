@@ -16,27 +16,35 @@ package argsutil
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"github.com/liangdas/mqant/log"
 	"github.com/liangdas/mqant/module"
+	"github.com/liangdas/mqant/rpc"
 	"github.com/liangdas/mqant/utils"
 	"reflect"
+	"strings"
 )
 
 var (
-	NULL   = "null"   //nil   null
-	BOOL   = "bool"   //bool
-	INT    = "int"    //int
-	LONG   = "long"   //long64
-	FLOAT  = "float"  //float32
-	DOUBLE = "double" //float64
-	BYTES  = "bytes"  //[]byte
-	STRING = "string" //string
-	MAP    = "map"    //map[string]interface{}
-	MAPSTR = "mapstr" //map[string]string{}
-	TRACE  = "trace"  //log.TraceSpanImp
+	NULL    = "null"    //nil   null
+	BOOL    = "bool"    //bool
+	INT     = "int"     //int
+	LONG    = "long"    //long64
+	FLOAT   = "float"   //float32
+	DOUBLE  = "double"  //float64
+	BYTES   = "bytes"   //[]byte
+	STRING  = "string"  //string
+	MAP     = "map"     //map[string]interface{}
+	MAPSTR  = "mapstr"  //map[string]string{}
+	TRACE   = "trace"   //log.TraceSpanImp
+	Marshal = "marshal" //mqrpc.Marshaler
+	Proto   = "proto"   //proto.Message
 )
 
 func ArgsTypeAnd2Bytes(app module.App, arg interface{}) (string, []byte, error) {
+	if arg == nil {
+		return NULL, nil, nil
+	}
 	switch v2 := arg.(type) {
 	case []uint8:
 		return BYTES, v2, nil
@@ -90,11 +98,52 @@ func ArgsTypeAnd2Bytes(app module.App, arg interface{}) (string, []byte, error) 
 				return ptype, vk, err
 			}
 		}
-		return "", nil, fmt.Errorf("args [%s] Types not allowed", reflect.TypeOf(arg))
+
+		rv := reflect.ValueOf(arg)
+		if rv.Kind() != reflect.Ptr {
+			//不是指针
+			return "", nil, fmt.Errorf("Args2Bytes [%v] not registered to app.addrpcserialize(...) structure type or not *mqrpc.marshaler pointer type", reflect.TypeOf(arg))
+		} else {
+			if rv.IsNil() {
+				//如果是nil则直接返回
+				return NULL, nil, nil
+			}
+			if v2, ok := arg.(mqrpc.Marshaler); ok {
+				b, err := v2.Marshal()
+				if err != nil {
+					return "", nil, fmt.Errorf("args [%s] marshal error %v", reflect.TypeOf(arg), err)
+				}
+				if v2.String() != "" {
+					return fmt.Sprintf("%v@%v", Marshal, v2.String()), b, nil
+				} else {
+					return fmt.Sprintf("%v@%v", Marshal, reflect.TypeOf(arg)), b, nil
+				}
+			}
+			if v2, ok := arg.(proto.Message); ok {
+				b, err := proto.Marshal(v2)
+				if err != nil {
+					log.Error("proto.Marshal error")
+					return "", nil, fmt.Errorf("args [%s] proto.Marshal error %v", reflect.TypeOf(arg), err)
+				}
+				if v2.String() != "" {
+					return fmt.Sprintf("%v@%v", Proto, v2.String()), b, nil
+				} else {
+					return fmt.Sprintf("%v@%v", Proto, reflect.TypeOf(arg)), b, nil
+				}
+			}
+		}
+
+		return "", nil, fmt.Errorf("Args2Bytes [%s] not registered to app.addrpcserialize(...) structure type", reflect.TypeOf(arg))
 	}
 }
 
 func Bytes2Args(app module.App, argsType string, args []byte) (interface{}, error) {
+	if strings.HasPrefix(argsType, Marshal) {
+		return args, nil
+	}
+	if strings.HasPrefix(argsType, Proto) {
+		return args, nil
+	}
 	switch argsType {
 	case NULL:
 		return nil, nil
@@ -139,6 +188,6 @@ func Bytes2Args(app module.App, argsType string, args []byte) (interface{}, erro
 				return vk, err
 			}
 		}
-		return nil, fmt.Errorf("args [%s] Types not allowed", argsType)
+		return nil, fmt.Errorf("Bytes2Args [%s] not registered to app.addrpcserialize(...)", argsType)
 	}
 }

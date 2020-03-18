@@ -16,11 +16,8 @@ package basegate
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"runtime"
-	"strings"
-	"time"
-
 	"github.com/liangdas/mqant/conf"
 	"github.com/liangdas/mqant/gate"
 	"github.com/liangdas/mqant/gate/base/mqtt"
@@ -29,7 +26,10 @@ import (
 	"github.com/liangdas/mqant/network"
 	"github.com/liangdas/mqant/rpc/util"
 	"github.com/liangdas/mqant/utils"
-	"github.com/Jeffail/tunny"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
 )
 
 //type resultInfo struct {
@@ -46,11 +46,13 @@ type agent struct {
 	w                                *bufio.Writer
 	gate                             gate.Gate
 	client                           *mqtt.Client
-	gpool 				 *tunny.Pool
+	ch                               chan int //控制模块可同时开启的最大协程数
 	isclose                          bool
-	last_storage_heartbeat_data_time int64 //上一次发送存储心跳时间
+	lock                             sync.Mutex
+	last_storage_heartbeat_data_time time.Duration //上一次发送存储心跳时间
 	rev_num                          int64
 	send_num                         int64
+	conn_time                        time.Time
 }
 
 func NewMqttAgent(module module.RPCModule) *agent {
@@ -60,17 +62,15 @@ func NewMqttAgent(module module.RPCModule) *agent {
 	return a
 }
 func (this *agent) OnInit(gate gate.Gate, conn network.Conn) error {
-	this.gpool = tunny.NewFunc(1, func(pack interface{})interface {}{
-		this.recoverworker(pack.(*mqtt.Pack))
-		return nil
-	})
+	this.ch = make(chan int, gate.Options().ConcurrentTasks)
 	this.conn = conn
 	this.gate = gate
-	this.r = bufio.NewReaderSize(conn, 2048)
-	this.w = bufio.NewWriterSize(conn, 2048)
+	this.r = bufio.NewReaderSize(conn, gate.Options().BufSize)
+	this.w = bufio.NewWriterSize(conn, gate.Options().BufSize)
 	this.isclose = false
 	this.rev_num = 0
 	this.send_num = 0
+	this.last_storage_heartbeat_data_time = time.Duration(time.Now().UnixNano())
 	return nil
 }
 func (a *agent) IsClosed() bool {
@@ -81,19 +81,56 @@ func (a *agent) GetSession() gate.Session {
 	return a.session
 }
 
+func (a *agent) Wait() error {
+	// 如果ch满了则会处于阻塞，从而达到限制最大协程的功能
+	select {
+	case a.ch <- 1:
+	//do nothing
+	default:
+		//warnning!
+		return fmt.Errorf("the work queue is full!")
+	}
+	return nil
+}
+func (a *agent) Finish() {
+	// 完成则从ch推出数据
+	select {
+	case <-a.ch:
+	default:
+	}
+}
+
 func (a *agent) Run() (err error) {
 	defer func() {
 		if err := recover(); err != nil {
-			buff := make([]byte, 4096)
+			buff := make([]byte, 1024)
 			runtime.Stack(buff, false)
 			log.Error("conn.serve() panic(%v)\n info:%s", err, string(buff))
 		}
 		a.Close()
 
 	}()
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				buff := make([]byte, 1024)
+				runtime.Stack(buff, false)
+				log.Error("OverTime panic(%v)\n info:%s", err, string(buff))
+			}
+		}()
+		select {
+		case <-time.After(a.gate.Options().OverTime):
+			if a.GetSession() == nil {
+				//超过一段时间还没有建立mqtt连接则直接关闭网络连接
+				a.Close()
+			}
+
+		}
+	}()
+
 	//握手协议
 	var pack *mqtt.Pack
-	pack, err = mqtt.ReadPack(a.r)
+	pack, err = mqtt.ReadPack(a.r, a.gate.Options().MaxPackSize)
 	if err != nil {
 		log.Error("Read login pack error", err)
 		return
@@ -102,7 +139,7 @@ func (a *agent) Run() (err error) {
 		log.Error("Recive login pack's type error:%v \n", pack.GetType())
 		return
 	}
-	info, ok := (pack.GetVariable()).(*mqtt.Connect)
+	conn, ok := (pack.GetVariable()).(*mqtt.Connect)
 	if !ok {
 		log.Error("It's not a mqtt connection package.")
 		return
@@ -110,12 +147,13 @@ func (a *agent) Run() (err error) {
 	//id := info.GetUserName()
 	//psw := info.GetPassword()
 	//log.Debug("Read login pack %s %s %s %s",*id,*psw,info.GetProtocol(),info.GetVersion())
-	c := mqtt.NewClient(conf.Conf.Mqtt, a, a.r, a.w, a.conn, info.GetKeepAlive())
+	c := mqtt.NewClient(conf.Conf.Mqtt, a, a.r, a.w, a.conn, conn.GetKeepAlive(), a.gate.Options().MaxPackSize)
 	a.client = c
+	addr := a.conn.RemoteAddr()
 	a.session, err = NewSessionByMap(a.module.GetApp(), map[string]interface{}{
 		"Sessionid": utils.GenerateID().String(),
-		"Network":   a.conn.RemoteAddr().Network(),
-		"IP":        a.conn.RemoteAddr().String(),
+		"Network":   addr.Network(),
+		"IP":        addr.String(),
 		"Serverid":  a.module.GetServerId(),
 		"Settings":  make(map[string]string),
 	})
@@ -124,20 +162,26 @@ func (a *agent) Run() (err error) {
 		return
 	}
 	a.session.JudgeGuest(a.gate.GetJudgeGuest())
-	a.session.CreateTrace()             //代码跟踪
-	a.gate.GetAgentLearner().Connect(a) //发送连接成功的事件
-
+	a.session.CreateTrace() //代码跟踪
 	//回复客户端 CONNECT
 	err = mqtt.WritePack(mqtt.GetConnAckPack(0), a.w)
 	if err != nil {
 		return
 	}
-
-	c.Listen_loop() //开始监听,直到连接中断
+	a.conn_time = time.Now()
+	a.gate.GetAgentLearner().Connect(a) //发送连接成功的事件
+	c.Listen_loop()                     //开始监听,直到连接中断
 	return nil
 }
 
 func (a *agent) OnClose() error {
+	defer func() {
+		if err := recover(); err != nil {
+			buff := make([]byte, 1024)
+			runtime.Stack(buff, false)
+			log.Error("agent OnClose panic(%v)\n info:%s", err, string(buff))
+		}
+	}()
 	a.isclose = true
 	a.gate.GetAgentLearner().DisConnect(a) //发送连接断开的事件
 	return nil
@@ -149,51 +193,63 @@ func (a *agent) RevNum() int64 {
 func (a *agent) SendNum() int64 {
 	return a.send_num
 }
-func (a *agent) OnRecover(pack *mqtt.Pack)  {
-	if int(a.gpool.QueueLength())>=a.gpool.GetSize(){
-		//协成池用满了
-		if a.gpool.GetSize()>=5{
-			log.TInfo(nil,"QueueLength full >= %v",a.gpool.QueueLength())
-		}else{
-			a.gpool.SetSize(a.gpool.GetSize()+1)
-		}
-	}
-	a.gpool.Process(pack)
+func (a *agent) ConnTime() time.Time {
+	return a.conn_time
 }
+func (a *agent) OnRecover(pack *mqtt.Pack) {
+	err := a.Wait()
+	if err != nil {
+		log.Error("Gate OnRecover error [%v]", err)
+		pub := pack.GetVariable().(*mqtt.Publish)
+		a.toResult(a, *pub.GetTopic(), nil, err.Error())
+	} else {
+		go a.recoverworker(pack)
+	}
+}
+
+func (this *agent) toResult(a *agent, Topic string, Result interface{}, Error string) error {
+	switch v2 := Result.(type) {
+	case module.ProtocolMarshal:
+		return a.WriteMsg(Topic, v2.GetData())
+	}
+	b, err := a.module.GetApp().ProtocolMarshal(a.session.TraceId(), Result, Error)
+	if err == "" {
+		if b!=nil{
+			return a.WriteMsg(Topic, b.GetData())
+		}else {
+			return nil
+		}
+	} else {
+		br, _ := a.module.GetApp().ProtocolMarshal(a.session.TraceId(), nil, err)
+		return a.WriteMsg(Topic, br.GetData())
+	}
+	return fmt.Errorf(err)
+}
+
 func (a *agent) recoverworker(pack *mqtt.Pack) {
+	defer a.Finish()
 	defer func() {
 		if r := recover(); r != nil {
-			log.Error("Gate  OnRecover error [%s]", r)
+			buff := make([]byte, 1024)
+			runtime.Stack(buff, false)
+			log.Error("Gate recoverworker error [%v] stack : %v", r, string(buff))
 		}
 	}()
 
-	toResult := func(a *agent, Topic string, Result interface{}, Error string) error {
-		switch v2 := Result.(type) {
-		case module.ProtocolMarshal:
-			return a.WriteMsg(Topic, v2.GetData())
-		}
-		b, err := a.module.GetApp().ProtocolMarshal(a.session.TraceId(), Result, Error)
-		if err == "" {
-			return a.WriteMsg(Topic, b.GetData())
-		} else {
-			log.Error(err)
-			br, _ := a.module.GetApp().ProtocolMarshal(a.session.TraceId(), nil, err)
-			return a.WriteMsg(Topic, br.GetData())
-		}
-		return fmt.Errorf(err)
-	}
+	toResult := a.toResult
 	//路由服务
 	switch pack.GetType() {
 	case mqtt.PUBLISH:
+		a.lock.Lock()
 		a.rev_num = a.rev_num + 1
+		a.lock.Unlock()
 		pub := pack.GetVariable().(*mqtt.Publish)
 		topics := strings.Split(*pub.GetTopic(), "/")
-		a.session.CreateTrace()
 		if a.gate.GetRouteHandler() != nil {
-			needreturn, result, err := a.gate.GetRouteHandler().OnRoute(a.session, *pub.GetTopic(), pub.GetMsg())
+			needreturn, result, err := a.gate.GetRouteHandler().OnRoute(a.GetSession(), *pub.GetTopic(), pub.GetMsg())
 			if err != nil {
 				if needreturn {
-					toResult(a, *pub.GetTopic(), nil, err.Error())
+					toResult(a, *pub.GetTopic(), result, err.Error())
 				}
 				return
 			} else {
@@ -220,17 +276,7 @@ func (a *agent) recoverworker(pack *mqtt.Pack) {
 			}
 			var ArgsType []string = make([]string, 2)
 			var args [][]byte = make([][]byte, 2)
-			hash := ""
-			if a.session.GetUserId() != "" {
-				hash = a.session.GetUserId()
-			} else {
-				hash = a.module.GetServerId()
-			}
-			//if (a.gate.GetTracingHandler() != nil) && a.gate.GetTracingHandler().OnRequestTracing(a.session, *pub.GetTopic(), pub.GetMsg()) {
-			//	a.session.CreateRootSpan("gate")
-			//}
-
-			serverSession, err := a.module.GetRouteServer(topics[0], hash)
+			serverSession, err := a.module.GetRouteServer(topics[0])
 			if err != nil {
 				if msgid != "" {
 					toResult(a, *pub.GetTopic(), nil, fmt.Sprintf("Service(type:%s) not found", topics[0]))
@@ -253,18 +299,20 @@ func (a *agent) recoverworker(pack *mqtt.Pack) {
 				ArgsType[1] = argsutil.BYTES
 				args[1] = pub.GetMsg()
 			}
+			session := a.GetSession().Clone()
+			session.SetTopic(*pub.GetTopic())
 			if msgid != "" {
 				ArgsType[0] = RPC_PARAM_SESSION_TYPE
-				b, err := a.GetSession().Serializable()
+				b, err := session.Serializable()
 				if err != nil {
 					return
 				}
 				args[0] = b
-				result, e := serverSession.CallArgs(topics[1], ArgsType, args)
+				result, e := serverSession.CallArgs(nil, topics[1], ArgsType, args)
 				toResult(a, *pub.GetTopic(), result, e)
 			} else {
 				ArgsType[0] = RPC_PARAM_SESSION_TYPE
-				b, err := a.GetSession().Serializable()
+				b, err := session.Serializable()
 				if err != nil {
 					return
 				}
@@ -276,43 +324,62 @@ func (a *agent) recoverworker(pack *mqtt.Pack) {
 				}
 			}
 		}
-		if a.GetSession().GetUserId() != "" {
-			//这个链接已经绑定Userid
-			interval := time.Now().Unix() - a.last_storage_heartbeat_data_time //单位秒
-			if interval > a.gate.GetMinStorageHeartbeat() {
-				//如果用户信息存储心跳包的时长已经大于一秒
-				if a.gate.GetStorageHandler() != nil {
-					a.gate.GetStorageHandler().Heartbeat(a.GetSession().GetUserId())
-					a.last_storage_heartbeat_data_time = time.Now().Unix()
-				}
+		//if a.GetSession().GetUserId() != "" {
+		//这个链接已经绑定Userid
+		a.lock.Lock()
+		interval := int64(a.last_storage_heartbeat_data_time) + int64(a.gate.Options().Heartbeat) //单位纳秒
+		a.lock.Unlock()
+		if interval < time.Now().UnixNano() {
+			if a.gate.GetStorageHandler() != nil {
+				a.lock.Lock()
+				a.last_storage_heartbeat_data_time = time.Duration(time.Now().UnixNano())
+				a.lock.Unlock()
+				a.gate.GetStorageHandler().Heartbeat(a.GetSession())
 			}
 		}
+		//}
 	case mqtt.PINGREQ:
 		//客户端发送的心跳包
-		if a.GetSession().GetUserId() != "" {
-			//这个链接已经绑定Userid
-			interval := time.Now().Unix() - a.last_storage_heartbeat_data_time //单位秒
-			if interval > a.gate.GetMinStorageHeartbeat() {
-				//如果用户信息存储心跳包的时长已经大于60秒
-				if a.gate.GetStorageHandler() != nil {
-					a.gate.GetStorageHandler().Heartbeat(a.GetSession().GetUserId())
-					a.last_storage_heartbeat_data_time = time.Now().Unix()
-				}
+		//if a.GetSession().GetUserId() != "" {
+		//这个链接已经绑定Userid
+		a.lock.Lock()
+		interval := int64(a.last_storage_heartbeat_data_time) + int64(a.gate.Options().Heartbeat) //单位纳秒
+		a.lock.Unlock()
+		if interval < time.Now().UnixNano() {
+			if a.gate.GetStorageHandler() != nil {
+				a.lock.Lock()
+				a.last_storage_heartbeat_data_time = time.Duration(time.Now().UnixNano())
+				a.lock.Unlock()
+				a.gate.GetStorageHandler().Heartbeat(a.GetSession())
 			}
 		}
+		//}
 	}
 }
 
 func (a *agent) WriteMsg(topic string, body []byte) error {
+	if a.client == nil {
+		return errors.New("mqtt.Client nil")
+	}
 	a.send_num++
+	if a.gate.Options().SendMessageHook != nil {
+		bb, err := a.gate.Options().SendMessageHook(a.GetSession(), topic, body)
+		if err != nil {
+			return err
+		}
+		body = bb
+	}
 	return a.client.WriteMsg(topic, body)
 }
 
 func (a *agent) Close() {
-	a.conn.Close()
+	if a.conn != nil {
+		a.conn.Close()
+	}
 }
 
 func (a *agent) Destroy() {
-	a.conn.Destroy()
-	a.gpool.Close()
+	if a.conn != nil {
+		a.conn.Destroy()
+	}
 }

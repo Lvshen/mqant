@@ -301,7 +301,7 @@ func parse_flags(b byte, flag *Connect) {
 }
 
 // Read and Write a mqtt pack
-func ReadPack(r *bufio.Reader) (pack *Pack, err error) {
+func ReadPack(r *bufio.Reader, max_pack_length int) (pack *Pack, err error) {
 	// Read the fixed header
 	var (
 		fixed     byte
@@ -342,6 +342,10 @@ func ReadPack(r *bufio.Reader) (pack *Pack, err error) {
 			break
 		}
 	}
+	if pack.length > max_pack_length {
+		err = fmt.Errorf("pack out of max length:%v", max_pack_length)
+		return
+	}
 	// Read the Variable header and the playload
 	// Check the msg type
 	switch pack.msg_type {
@@ -380,7 +384,7 @@ func ReadPack(r *bufio.Reader) (pack *Pack, err error) {
 		if err != nil {
 			break
 		}
-		if n > 23 || n < 1 {
+		if n > 64 || n < 1 {
 			err = fmt.Errorf("Identifier Rejected length is:%v", n)
 			conn.return_code = 2
 			break

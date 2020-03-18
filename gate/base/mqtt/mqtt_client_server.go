@@ -30,11 +30,10 @@ type PackRecover interface {
 	OnRecover(*Pack)
 }
 
-
 type Client struct {
 	queue *PackQueue
 
-	recover  PackRecover        //消息接收者,从上层接口传过来的 只接收正式消息(心跳包,回复包等都不要)
+	recover PackRecover //消息接收者,从上层接口传过来的 只接收正式消息(心跳包,回复包等都不要)
 
 	isStop bool
 	lock   *sync.Mutex
@@ -43,13 +42,13 @@ type Client struct {
 	curr_id int
 }
 
-func NewClient(conf conf.Mqtt, recover PackRecover, r *bufio.Reader, w *bufio.Writer, conn network.Conn, alive int) *Client {
-	client:=&Client{
-		recover:   recover,
-		lock:      new(sync.Mutex),
-		curr_id:   0,
+func NewClient(conf conf.Mqtt, recover PackRecover, r *bufio.Reader, w *bufio.Writer, conn network.Conn, alive, MaxPackSize int) *Client {
+	client := &Client{
+		recover: recover,
+		lock:    new(sync.Mutex),
+		curr_id: 0,
 	}
-	client.queue=NewPackQueue(conf, r, w, conn, client.waitPack, alive)
+	client.queue = NewPackQueue(conf, r, w, conn, client.waitPack, alive, MaxPackSize)
 	return client
 }
 
@@ -96,14 +95,14 @@ func (c *Client) waitPack(pAndErr *packAndErr) (err error) {
 	// Choose the requst type
 	switch pAndErr.pack.GetType() {
 	case CONNECT:
-		info, ok := (pAndErr.pack.GetVariable()).(*Connect)
+		conn, ok := (pAndErr.pack.GetVariable()).(*Connect)
 		if !ok {
 			err = errors.New("It's not a mqtt connection package.")
 			return
 		}
 		//id := info.GetUserName()
 		//psw := info.GetPassword()
-		c.queue.SetAlive(info.GetKeepAlive())
+		c.queue.SetAlive(conn.GetKeepAlive())
 		err = c.queue.WritePack(GetConnAckPack(0))
 	case PUBLISH:
 		pub := pAndErr.pack.GetVariable().(*Publish)
@@ -174,13 +173,10 @@ func (c *Client) waitPack(pAndErr *packAndErr) (err error) {
 	return
 }
 
-
 func (c *Client) WriteMsg(topic string, body []byte) error {
-	c.lock.Lock()
 	if c.isStop {
 		return fmt.Errorf("connection is closed")
 	}
-	c.lock.Unlock()
 	pack := GetPubPack(0, 0, c.getOnlineMsgId(), &topic, body)
 	return c.queue.WritePack(pack)
 }
